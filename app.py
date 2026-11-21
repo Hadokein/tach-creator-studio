@@ -1,4 +1,7 @@
 import json
+import base64
+import time
+import threading
 import os
 import re
 from pathlib import Path
@@ -15,9 +18,65 @@ USER_ID = '7fd088f2-79a4-4ec4-a2a1-f1b45724fb99'
 NICKNAME = 'vladislove'
 SAMPLE_CONTENT_ID = 'b3fd8adf-89c3-40a4-943f-8258b0225371'
 PUBLIC_POST_PATH = '/p/vladislove/post/66ff2cb9'
-VERSION = '2.2'
+VERSION = '2.3'
 SESSION = requests.Session()
-SESSION.headers.update({'Accept': 'application/json', 'User-Agent': 'TachCreatorStudio/2.2'})
+SESSION.headers.update({'Accept': 'application/json', 'User-Agent': 'TachCreatorStudio/2.3'})
+APP_VERSION = 'Tach/1.16.3 (WEB; 1; prod)'
+GUEST_LOCK = threading.RLock()
+GUEST_CACHE = {'token': None, 'expires_at': 0}
+
+
+def _jwt_exp(token):
+    try:
+        payload = token.split('.')[1]
+        payload += '=' * (-len(payload) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(payload))
+        exp = decoded.get('exp')
+        return int(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else 0
+    except (ValueError, IndexError, TypeError, UnicodeDecodeError):
+        return 0
+
+
+def get_guest_token(force=False):
+    # Same public guest-token route used by Tach's browser client.
+    with GUEST_LOCK:
+        if (not force and GUEST_CACHE['token'] and
+                GUEST_CACHE['expires_at'] > time.time() + 30):
+            return GUEST_CACHE['token']
+        response = SESSION.get(
+            TACH + '/api/guest-token',
+            headers={'Accept': 'application/json', 'X-App-Version': APP_VERSION},
+            timeout=12,
+        )
+        response.raise_for_status()
+        data = response.json()
+        token = data.get('token') if isinstance(data, dict) else None
+        if not isinstance(token, str) or not token:
+            raise ValueError('Guest token response is missing token')
+        expiry = _jwt_exp(token)
+        if expiry <= time.time() + 30:
+            raise ValueError('Guest token is expired or invalid')
+        GUEST_CACHE.update(token=token, expires_at=expiry)
+        return token
+
+
+def tach_api_get(path, params=None):
+    token = get_guest_token()
+    for attempt in range(2):
+        response = SESSION.get(
+            TACH + path, params=params, timeout=15,
+            headers={
+                'Authorization': 'Bearer ' + token,
+                'X-App-Version': APP_VERSION,
+                'Accept': 'application/json',
+            },
+        )
+        if response.status_code == 401 and attempt == 0:
+            token = get_guest_token(force=True)
+            continue
+        return response
+    return response
+
 
 
 def classify_error(response):
@@ -429,7 +488,7 @@ def health():
 
 def fetch(path, params=None):
     try:
-        response = SESSION.get(TACH + path, params=params, timeout=15)
+        response = tach_api_get(path, params)
         response.raise_for_status()
         return response.json(), None
     except requests.HTTPError as exc:
@@ -444,7 +503,41 @@ def fetch(path, params=None):
         app.logger.warning('Tach connection error: %s', type(exc).__name__)
         return None, {'error': 'ÐÑÐ¸Ð±ÐºÐ° Ð¿Ð¾Ð´ÐºÐ»ÑÑÐµÐ½Ð¸Ñ Ðº Tach', 'type': type(exc).__name__}
     except ValueError:
-        return None, {'error': 'Tach Ð²ÐµÑÐ½ÑÐ» Ð½Ðµ JSON'}
+        return None, {'error': 'Tach Ð²ÐµÑÐ½ÑÐ» Ð½ÐµÐºÐ¾ÑÑÐµÐºÑÐ½ÑÐ¹ JSON Ð¸Ð»Ð¸ Ð³Ð¾ÑÑÐµÐ²Ð¾Ð¹ ÑÐ¾ÐºÐµÐ½'}
+
+
+@app.get('/api/guest-auth-check')
+def guest_auth_check():
+    try:
+        token = get_guest_token()
+        response = tach_api_get(
+            f'/api/v1/counters/usercontent/{SAMPLE_CONTENT_ID}/'
+        )
+        result = {
+            'version': VERSION,
+            'guest_token_obtained': bool(token),
+            'guest_token_expiry_seconds': max(0, int(GUEST_CACHE['expires_at'] - time.time())),
+            'app_version': APP_VERSION,
+            'counters_status': response.status_code,
+            'counters_content_type': response.headers.get('Content-Type', '').split(';')[0],
+        }
+        if response.ok:
+            try:
+                data = response.json()
+                result['counters_fields_present'] = [
+                    key for key in ('content_viewing', 'content_like_like', 'content_comments')
+                    if isinstance(data, dict) and key in data
+                ]
+            except ValueError:
+                result['counters_json_valid'] = False
+        else:
+            result['counters_error'] = classify_error(response)['tach_message']
+        return jsonify(result)
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        return jsonify({'version': VERSION, 'guest_token_status': status, 'error': 'Guest token endpoint returned HTTP error'}), 502
+    except (requests.RequestException, ValueError) as exc:
+        return jsonify({'version': VERSION, 'error': type(exc).__name__, 'stage': 'guest_token'}), 502
 
 
 @app.get('/api/videos')
@@ -511,7 +604,7 @@ def diagnostics():
     results = {}
     for name, path, params in checks:
         try:
-            response = SESSION.get(TACH + path, params=params, timeout=10)
+            response = tach_api_get(path, params)
             entry = {'status': response.status_code, 'content_type': response.headers.get('Content-Type', '').split(';', 1)[0].strip().lower()}
             if response.status_code >= 400:
                 entry['message'] = classify_error(response)['tach_message']
