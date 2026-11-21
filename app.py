@@ -4,7 +4,7 @@ from urllib.parse import urlparse
 from flask import Flask, jsonify, request, send_from_directory
 import requests
 
-app = Flask(__name__, static_folder='static')
+app = Flask(__name__)
 TACH = 'https://tach.id'
 SESSION = requests.Session()
 SESSION.headers.update({'Accept':'application/json','User-Agent':'TachCreatorStudio/0.1 (+public stats)'})
@@ -12,7 +12,7 @@ USER_ID = '7fd088f2-79a4-4ec4-a2a1-f1b45724fb99'
 
 @app.get('/')
 def home():
-    return send_from_directory('static', 'index.html')
+    return send_from_directory('.', 'index.html')
 
 @app.get('/api/health')
 def health():
