@@ -3,6 +3,7 @@ import os
 import re
 from pathlib import Path
 from html.parser import HTMLParser
+from urllib.parse import urljoin, urlparse
 
 import requests
 from flask import Flask, jsonify, request, send_from_directory
@@ -14,9 +15,9 @@ USER_ID = '7fd088f2-79a4-4ec4-a2a1-f1b45724fb99'
 NICKNAME = 'vladislove'
 SAMPLE_CONTENT_ID = 'b3fd8adf-89c3-40a4-943f-8258b0225371'
 PUBLIC_POST_PATH = '/p/vladislove/post/66ff2cb9'
-VERSION = '1.6'
+VERSION = '1.7'
 SESSION = requests.Session()
-SESSION.headers.update({'Accept': 'application/json', 'User-Agent': 'TachCreatorStudio/1.6'})
+SESSION.headers.update({'Accept': 'application/json', 'User-Agent': 'TachCreatorStudio/1.7'})
 
 
 def classify_error(response):
@@ -111,6 +112,82 @@ def public_page_probe():
         return jsonify(result)
     except requests.Timeout:
         return jsonify({'version': VERSION, 'error': 'timeout'})
+    except requests.RequestException as exc:
+        return jsonify({'version': VERSION, 'error': type(exc).__name__})
+
+
+class ScriptInventoryParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.scripts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag != 'script':
+            return
+        src = dict(attrs).get('src', '')
+        if src.startswith('/_next/static/') and src.endswith('.js'):
+            if src not in self.scripts:
+                self.scripts.append(src)
+
+
+@app.get('/api/source-inspect')
+def source_inspect():
+    """Read-only inspection of public HTML and a small number of public JS bundles.
+
+    No upstream URLs or credentials accepted from the client. No raw JS or secrets returned.
+    """
+    try:
+        page = SESSION.get(TACH + PUBLIC_POST_PATH, timeout=12,
+                           headers={'Accept': 'text/html'})
+        result = {'version': VERSION, 'page_status': page.status_code}
+        if not page.ok:
+            result['error'] = classify_error(page)['tach_message']
+            return jsonify(result)
+        html = page.text
+        inv = ScriptInventoryParser()
+        inv.feed(html)
+        result['html'] = {
+            'bytes': len(page.content),
+            'next_f_blocks': html.count('self.__next_f.push'),
+            'js_files_found': len(inv.scripts),
+            'post_id_present': '66ff2cb9' in html,
+            'content_uuid_present': SAMPLE_CONTENT_ID in html,
+            'profile_uuid_present': USER_ID in html,
+            'counter_names': {key: key in html for key in
+                              ('content_viewing', 'content_like_like', 'content_comments')},
+            'embedded_hints': {key: key in html for key in
+                               ('userContent', 'usercontent', 'published', 'nickname', 'views', 'viewCount')},
+        }
+        # Scan a bounded subset, prioritizing route-specific and app bundles.
+        scripts = sorted(inv.scripts, key=lambda src: (
+            0 if '/app/' in src else 1 if 'main-app' in src else 2,
+            src
+        ))[:8]
+        markers = ('counters/usercontent', 'content_viewing', 'authorization',
+                   'bearer', '/api/v1/', 'usercontent')
+        bundles = []
+        for src in scripts:
+            entry = {'file': src}
+            try:
+                js_url = urljoin(TACH, src)
+                if urlparse(js_url).netloc != 'tach.id':
+                    continue
+                resp = SESSION.get(js_url, timeout=8,
+                                   headers={'Accept': 'application/javascript'})
+                entry['status'] = resp.status_code
+                entry['bytes'] = len(resp.content)
+                if resp.ok and len(resp.content) <= 5_000_000:
+                    lower = resp.text.lower()
+                    entry['markers'] = {m: lower.count(m) for m in markers}
+                elif not resp.ok:
+                    entry['message'] = classify_error(resp)['tach_message']
+            except requests.RequestException as exc:
+                entry['error'] = type(exc).__name__
+            bundles.append(entry)
+        result['bundles'] = bundles
+        result['note'] = ('Marker counts identify candidate bundles, not the '
+                          'authorization mechanism. No credentials are collected.')
+        return jsonify(result)
     except requests.RequestException as exc:
         return jsonify({'version': VERSION, 'error': type(exc).__name__})
 
