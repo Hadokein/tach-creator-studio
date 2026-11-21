@@ -15,7 +15,7 @@ USER_ID = '7fd088f2-79a4-4ec4-a2a1-f1b45724fb99'
 NICKNAME = 'vladislove'
 SAMPLE_CONTENT_ID = 'b3fd8adf-89c3-40a4-943f-8258b0225371'
 PUBLIC_POST_PATH = '/p/vladislove/post/66ff2cb9'
-VERSION = '1.8'
+VERSION = '1.9'
 SESSION = requests.Session()
 SESSION.headers.update({'Accept': 'application/json', 'User-Agent': 'TachCreatorStudio/1.7'})
 
@@ -244,6 +244,58 @@ def source_inspect_deep():
     except requests.RequestException as exc:
         return jsonify({'version': VERSION, 'error': type(exc).__name__})
 
+
+
+@app.get('/api/auth-client-inspect')
+def auth_client_inspect():
+    """Inspect public Tach client implementation, without retrieving credentials."""
+    targets = {
+        'api_schema': '/_next/static/chunks/422-5df1ddcb9ef44d09.js',
+        'http_library': '/_next/static/chunks/4385-e13dd9f6eb36281f.js',
+        'counter_ui': '/_next/static/chunks/3943-eee345068b2fc289.js',
+    }
+    needles = {
+        'counter_method': 'oneCountersUsercontentApiV1CountersUsercontentUsercontentIdGet',
+        'counter_path': '/counters/usercontent/',
+        'http_bearer_schema': 'HTTPBearer',
+        'authorization_header': 'authorization',
+        'axios_interceptor': 'interceptors.request',
+        'access_token_refresh': 'getAccessTokenPayloadSecurely',
+        'api_base_url': 'apiUrl',
+    }
+    out = {}
+    for name, path in targets.items():
+        try:
+            response = SESSION.get(TACH + path, timeout=12)
+            entry = {'status': response.status_code, 'bytes': len(response.content)}
+            if response.ok and len(response.content) <= 2_000_000:
+                source = response.text
+                lower = source.lower()
+                entry['matches'] = {}
+                for label, needle in needles.items():
+                    indices = [m.start() for m in list(re.finditer(re.escape(needle.lower()), lower))[:5]]
+                    entry['matches'][label] = {'count': lower.count(needle.lower()), 'offsets': indices}
+                # Only return narrowly scoped API route and method contexts.
+                # No raw Authorization or token-bearing JavaScript is returned.
+                contexts = []
+                for label in ('counter_method', 'counter_path', 'http_bearer_schema'):
+                    needle = needles[label]
+                    pos = lower.find(needle.lower())
+                    if pos >= 0:
+                        fragment = source[max(0, pos - 100):pos + len(needle) + 180]
+                        fragment = re.sub(r'(?i)(bearer\s+)[a-z0-9._~+/-]+', r'\1[REDACTED]', fragment)
+                        fragment = re.sub(r'(?i)(authorization["\\\']?\s*[:=]\s*["\\\'])[^"\\\']+', r'\1[REDACTED]', fragment)
+                        contexts.append({'kind': label, 'excerpt': fragment})
+                entry['route_excerpts'] = contexts[:3]
+            out[name] = entry
+        except requests.RequestException as exc:
+            out[name] = {'error': type(exc).__name__}
+    return jsonify({
+        'version': VERSION,
+        'bundles': out,
+        'interpretation': 'Presence of HTTPBearer is a schema declaration, not proof of required authentication for a specific public endpoint.',
+        'note': 'Read-only analysis of three fixed public JavaScript bundles. No cookies, user tokens or authentication secrets are requested.'
+    })
 
 @app.get('/api/health')
 def health():
