@@ -909,6 +909,62 @@ def diagnostics():
     })
 
 
+@app.get("/api/session-source-inspect")
+def session_source_inspect():
+    path = (
+        "/_next/static/chunks/"
+        "422-5df1ddcb9ef44d09.js"
+    )
+
+    try:
+        response = SESSION.get(
+            TACH + path,
+            timeout=18
+        )
+        response.raise_for_status()
+
+        source = response.text
+
+        modules = {}
+
+        for module_id, label in (
+            ("60051", "auth_helper"),
+            ("38468", "app_version")
+        ):
+            match = re.search(
+                r"(?<!\d)" + module_id + r":\s*\(",
+                source
+            )
+
+            if match:
+                start = match.start()
+                modules[label] = {
+                    "found": True,
+                    "offset": start,
+                    "source_excerpt": source[
+                        start:start + 2800
+                    ]
+                }
+            else:
+                modules[label] = {
+                    "found": False
+                }
+
+        return jsonify({
+            "version": "2.1",
+            "status": response.status_code,
+            "modules": modules,
+            "note": (
+                "Public JavaScript source only. "
+                "No user credentials requested."
+            )
+        })
+
+    except requests.RequestException as exc:
+        return jsonify({
+            "error": type(exc).__name__
+        }), 502
+
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
