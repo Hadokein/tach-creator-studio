@@ -15,7 +15,7 @@ USER_ID = '7fd088f2-79a4-4ec4-a2a1-f1b45724fb99'
 NICKNAME = 'vladislove'
 SAMPLE_CONTENT_ID = 'b3fd8adf-89c3-40a4-943f-8258b0225371'
 PUBLIC_POST_PATH = '/p/vladislove/post/66ff2cb9'
-VERSION = '1.7'
+VERSION = '1.8'
 SESSION = requests.Session()
 SESSION.headers.update({'Accept': 'application/json', 'User-Agent': 'TachCreatorStudio/1.7'})
 
@@ -188,6 +188,59 @@ def source_inspect():
         result['note'] = ('Marker counts identify candidate bundles, not the '
                           'authorization mechanism. No credentials are collected.')
         return jsonify(result)
+    except requests.RequestException as exc:
+        return jsonify({'version': VERSION, 'error': type(exc).__name__})
+
+
+@app.get('/api/source-inspect-deep')
+def source_inspect_deep():
+    """Inspect public JS bundles in batches, returning limited contextual excerpts."""
+    try:
+        batch = int(request.args.get('batch', '1'))
+    except ValueError:
+        return jsonify({'error': 'batch must be 1 through 5'}), 400
+    if batch not in range(1, 6):
+        return jsonify({'error': 'batch must be 1 through 5'}), 400
+    try:
+        page = SESSION.get(TACH + PUBLIC_POST_PATH, timeout=12, headers={'Accept': 'text/html'})
+        if not page.ok:
+            return jsonify({'version': VERSION, 'page_status': page.status_code})
+        inventory = ScriptInventoryParser()
+        inventory.feed(page.text)
+        files = inventory.scripts
+        selected = files[(batch - 1) * 8:batch * 8]
+        markers = ('usercontent', 'counter', 'authorization', 'bearer', 'api/v1',
+                   'content_viewing', 'fetch(', 'axios', 'interceptor', 'token')
+        entries = []
+        for src in selected:
+            entry = {'file': src}
+            try:
+                resp = SESSION.get(TACH + src, timeout=9)
+                entry['status'] = resp.status_code
+                entry['bytes'] = len(resp.content)
+                if resp.ok and len(resp.content) <= 5_000_000:
+                    lower = resp.text.lower()
+                    entry['markers'] = {m: lower.count(m) for m in markers}
+                    # Context only around non-sensitive routing and counter references.
+                    # Do not return token values, authorization header contents or full JS.
+                    excerpts = []
+                    for marker in ('usercontent', 'counter', 'api/v1', 'content_viewing'):
+                        start = 0
+                        for _ in range(3):
+                            idx = lower.find(marker, start)
+                            if idx < 0:
+                                break
+                            fragment = resp.text[max(0, idx-100):idx+160]
+                            fragment = re.sub(r'(?i)(bearer\s+)[a-z0-9._~+/-]+', r'\1[REDACTED]', fragment)
+                            excerpts.append({'marker': marker, 'context': fragment})
+                            start = idx + len(marker)
+                    entry['excerpts'] = excerpts[:8]
+            except requests.RequestException as exc:
+                entry['error'] = type(exc).__name__
+            entries.append(entry)
+        return jsonify({'version': VERSION, 'batch': batch, 'total_files': len(files),
+                        'files_in_batch': len(selected), 'bundles': entries,
+                        'note': 'Public JS excerpts; no authentication secrets requested.'})
     except requests.RequestException as exc:
         return jsonify({'version': VERSION, 'error': type(exc).__name__})
 
