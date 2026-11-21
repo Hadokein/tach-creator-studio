@@ -12,7 +12,7 @@ TACH = 'https://tach.id'
 USER_ID = '7fd088f2-79a4-4ec4-a2a1-f1b45724fb99'
 NICKNAME = 'vladislove'
 SESSION = requests.Session()
-SESSION.headers.update({'Accept': 'application/json', 'User-Agent': 'TachCreatorStudio/1.2'})
+SESSION.headers.update({'Accept': 'application/json', 'User-Agent': 'TachCreatorStudio/1.3'})
 
 
 @app.get('/')
@@ -24,7 +24,7 @@ def home():
 
 @app.get('/api/health')
 def health():
-    return jsonify({'ok': True, 'service': 'tach-creator-studio', 'version': '1.2', 'index_exists': (BASE_DIR / 'index.html').is_file()})
+    return jsonify({'ok': True, 'service': 'tach-creator-studio', 'version': '1.3', 'index_exists': (BASE_DIR / 'index.html').is_file()})
 
 
 def fetch(path, params=None):
@@ -34,8 +34,34 @@ def fetch(path, params=None):
         return response.json(), None
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else None
-        app.logger.warning('Tach returned HTTP %s for %s', status, path)
-        return None, {'error': f'Tach вернул HTTP {status}', 'tach_status': status}
+        # Only report a safe, classified message. Never expose upstream response
+        # bodies, cookies, credentials or request headers in a public endpoint.
+        upstream = exc.response
+        content_type = (upstream.headers.get('Content-Type', '') if upstream is not None else '').split(';', 1)[0].strip().lower()
+        body = (upstream.text[:2048] if upstream is not None else '').lower()
+        if 'no authorization header found' in body:
+            detail = 'no Authorization header found'
+        elif 'access denied' in body:
+            detail = 'Access denied'
+        elif 'forbidden' in body:
+            detail = 'Forbidden'
+        elif 'rate limit' in body or 'too many requests' in body:
+            detail = 'Rate limit'
+        elif 'cloudflare' in body or 'captcha' in body:
+            detail = 'Страница защиты или проверки доступа'
+        elif content_type == 'text/html':
+            detail = 'Tach вернул HTML вместо JSON'
+        elif content_type == 'application/json':
+            detail = 'Tach вернул JSON с ошибкой (содержимое скрыто)'
+        else:
+            detail = 'Неизвестный ответ Tach (содержимое скрыто)'
+        app.logger.warning('Tach returned HTTP %s for %s: %s', status, path, detail)
+        return None, {
+            'error': f'Tach вернул HTTP {status}',
+            'tach_status': status,
+            'tach_message': detail,
+            'tach_content_type': content_type or 'не указан',
+        }
     except requests.Timeout:
         return None, {'error': 'Истекло время ожидания Tach'}
     except requests.RequestException as exc:
